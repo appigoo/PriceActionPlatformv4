@@ -1399,13 +1399,95 @@ def _render_volatility_spike(df, ticker: str, interval: str,
     st.plotly_chart(fig, use_container_width=True,
                     config={"scrollZoom": True, "displaylogo": False})
 
-    # 歷史觸發統計
+    # ── 歷史觸發詳細表格 ─────────────────────────────────────────────────────
     if triggered_hist:
         st.markdown(
-            f"<div style='font-size:.78rem;color:#c0392b;margin-top:.3rem'>"
-            f"⚡ 歷史上共 <b>{len(triggered_hist)}</b> 次同時觸發（{y_val:.1f}x 門檻），"
-            f"最近一次：{str(triggered_hist[-1]['date'])[:10]}</div>",
+            f"<div class='section-heading' style='font-size:.85rem'>"
+            f"⚡ 歷史同時觸發記錄（共 {len(triggered_hist)} 次，門檻 {y_val:.1f}x）</div>",
             unsafe_allow_html=True)
+
+        # 統計摘要
+        avg_p = sum(b['price_ratio']  for b in triggered_hist) / len(triggered_hist)
+        avg_v = sum(b['vol_ratio']    for b in triggered_hist) / len(triggered_hist)
+        max_p = max(b['price_ratio']  for b in triggered_hist)
+        max_v = max(b['vol_ratio']    for b in triggered_hist)
+
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        for col, label, val, suffix in [
+            (sc1, "觸發次數",    len(triggered_hist), "次"),
+            (sc2, "均價格倍數",  avg_p,               "x"),
+            (sc3, "均成交量倍數", avg_v,              "x"),
+            (sc4, "最大價格倍數", max_p,              "x"),
+        ]:
+            with col:
+                st.markdown(
+                    f"<div class='metric-card' style='text-align:center'>"
+                    f"<div class='metric-label'>{label}</div>"
+                    f"<div class='metric-value' style='color:#c0392b;font-size:1.4rem'>"
+                    f"{val:.2f}{suffix}</div></div>" if isinstance(val, float)
+                    else
+                    f"<div class='metric-card' style='text-align:center'>"
+                    f"<div class='metric-label'>{label}</div>"
+                    f"<div class='metric-value' style='color:#c0392b;font-size:1.4rem'>"
+                    f"{val}{suffix}</div></div>",
+                    unsafe_allow_html=True)
+
+        st.markdown("")
+
+        # 詳細表格（倒序：最新在前）
+        trig_rows = ""
+        for b in reversed(triggered_hist):
+            date_str  = str(b['date'])[:16]
+            p_r       = b['price_ratio']
+            v_r       = b['vol_ratio']
+            p_abs     = b['price_abs']
+            v_abs     = b['vol_abs']
+            close_v   = b['close']
+            # 強度評級
+            both_max  = max(p_r, v_r)
+            if both_max >= y_val * 3:
+                grade = "🔴 極強"
+                gbg   = "#fdecea"
+            elif both_max >= y_val * 2:
+                grade = "🟠 強"
+                gbg   = "#fff3e0"
+            else:
+                grade = "🟡 中"
+                gbg   = "#fffde7"
+
+            trig_rows += (
+                f"<tr style='background:{gbg}'>"
+                f"<td style='padding:6px 10px;font-size:.78rem;color:#6b6560'>{date_str}</td>"
+                f"<td style='padding:6px 10px;font-family:IBM Plex Mono,monospace;font-size:.78rem'>"
+                f"${close_v:.2f}</td>"
+                f"<td style='padding:6px 10px;font-family:IBM Plex Mono,monospace;font-size:.78rem'>"
+                f"{p_abs:+.2f}%</td>"
+                f"<td style='padding:6px 10px;font-family:IBM Plex Mono,monospace;font-size:.82rem;"
+                f"font-weight:700;color:#c0392b'>{p_r:.2f}x</td>"
+                f"<td style='padding:6px 10px;font-family:IBM Plex Mono,monospace;font-size:.78rem'>"
+                f"{v_abs:+.2f}%</td>"
+                f"<td style='padding:6px 10px;font-family:IBM Plex Mono,monospace;font-size:.82rem;"
+                f"font-weight:700;color:#c0392b'>{v_r:.2f}x</td>"
+                f"<td style='padding:6px 10px;font-size:.76rem'>{grade}</td>"
+                f"</tr>"
+            )
+
+        st.markdown(
+            f"<div style='border:1px solid #e0dbd2;border-radius:8px;overflow:auto;max-height:380px'>"
+            f"<table style='width:100%;border-collapse:collapse'>"
+            f"<thead><tr style='background:#fdecea;border-bottom:1.5px solid #f5b8b3;position:sticky;top:0'>"
+            f"<th style='padding:7px 10px;text-align:left;font-size:.71rem;color:#9e9890'>時間</th>"
+            f"<th style='padding:7px 10px;text-align:left;font-size:.71rem;color:#9e9890'>收盤價</th>"
+            f"<th style='padding:7px 10px;text-align:left;font-size:.71rem;color:#9e9890'>價格漲跌幅</th>"
+            f"<th style='padding:7px 10px;text-align:left;font-size:.71rem;color:#c0392b'>價格倍數</th>"
+            f"<th style='padding:7px 10px;text-align:left;font-size:.71rem;color:#9e9890'>成交量變幅</th>"
+            f"<th style='padding:7px 10px;text-align:left;font-size:.71rem;color:#c0392b'>成交量倍數</th>"
+            f"<th style='padding:7px 10px;text-align:left;font-size:.71rem;color:#9e9890'>強度</th>"
+            f"</tr></thead>"
+            f"<tbody>{trig_rows}</tbody>"
+            f"</table></div>",
+            unsafe_allow_html=True
+        )
 
     # ── Telegram 警報 ─────────────────────────────────────────────────────────
     if tg_enabled and both_triggered:

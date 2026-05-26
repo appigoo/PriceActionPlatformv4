@@ -83,7 +83,10 @@ _ss("alert_hashes",  set())
 _ss("active_tab",    0)
 _ss("gap_alerts",    {})   # {ticker: {cond_key: {enabled, last_fired}}}
 _ss("gap_monitor_on", False)  # 跳空監控總開關
-_ss("gap_monitor_fired", {})  # {ticker_dir_hash: True} 去重
+_ss("gap_monitor_fired",  {})  # {ticker_dir_hash: True} 去重
+_ss("spike_monitor_fired",{})  # {ticker_bar_hash: True} 去重
+_ss("spike_x",            20)   # 參考根數 X
+_ss("spike_y",            2.0)  # 觸發倍數 Y
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 import re as _re
@@ -1157,6 +1160,266 @@ def _render_gap_history(df, ticker: str, interval: str):
     )
 
 
+# ── 異常波動監控渲染 ──────────────────────────────────────────────────────────
+def _render_volatility_spike(df, ticker: str, interval: str,
+                             tg_token: str, tg_chat_id: str):
+    """渲染異常波動監控區塊：表格、圖表、Telegram 警報"""
+    from analysis.volatility_spike import (compute_volatility_spike,
+                                           find_triggered_bars,
+                                           build_spike_tg_msg)
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    # ── 參數輸入 ──────────────────────────────────────────────────────────────
+    pc1, pc2, pc3 = st.columns([2, 2, 3])
+    with pc1:
+        x_val = st.number_input(
+            "參考根數 X", min_value=5, max_value=100,
+            value=st.session_state.spike_x, step=1,
+            key=f"spike_x_{ticker}",
+            help="用前X根的均值作為基準"
+        )
+        st.session_state.spike_x = x_val
+    with pc2:
+        y_val = st.number_input(
+            "觸發倍數 Y", min_value=1.0, max_value=10.0,
+            value=st.session_state.spike_y, step=0.5,
+            format="%.1f",
+            key=f"spike_y_{ticker}",
+            help="兩個指標同時 ≥ Y 倍才觸發警報"
+        )
+        st.session_state.spike_y = y_val
+    with pc3:
+        has_tg = bool(tg_token and tg_chat_id)
+        spike_tg_key = f"spike_tg_{ticker}"
+        if spike_tg_key not in st.session_state:
+            st.session_state[spike_tg_key] = False
+        tg_enabled = st.toggle(
+            "🔔 Telegram 警報",
+            value=st.session_state[spike_tg_key],
+            key=f"spike_tg_toggle_{ticker}",
+            disabled=not has_tg,
+            help="需先填寫 Telegram 設定"
+        )
+        st.session_state[spike_tg_key] = tg_enabled
+        if not has_tg:
+            st.caption("⚠️ 請先填寫 Telegram 設定")
+
+    # ── 計算 ──────────────────────────────────────────────────────────────────
+    result = compute_volatility_spike(df, x=int(x_val))
+    if result is None:
+        st.info(f"數據不足（需要至少 {int(x_val)+2} 根K線）")
+        return
+
+    lat     = result['latest']
+    n       = result['n']
+    dates   = result['dates']
+    bars    = result['bars']
+    p_ratio = lat['price_ratio']
+    v_ratio = lat['vol_ratio']
+    both_triggered = p_ratio >= y_val and v_ratio >= y_val
+    triggered_hist = find_triggered_bars(result, y_val)
+
+    # ── 最新狀態卡片 ─────────────────────────────────────────────────────────
+    c1, c2, c3, c4 = st.columns(4)
+    p_col = "#c0392b" if p_ratio >= y_val else ("#b07d2e" if p_ratio >= y_val*0.7 else "#3d8c5f")
+    v_col = "#c0392b" if v_ratio >= y_val else ("#b07d2e" if v_ratio >= y_val*0.7 else "#3d8c5f")
+    t_col = "#c0392b" if both_triggered else "#9e9890"
+
+    with c1:
+        st.markdown(f"""<div class='metric-card' style='text-align:center'>
+          <div class='metric-label'>最新價格波動幅</div>
+          <div class='metric-value' style='font-size:1.3rem;color:{p_col}'>{lat['price_abs']:+.2f}%</div>
+          <div class='metric-sub' style='color:#9e9890'>前{int(x_val)}根均 {lat['avg_price_abs']:.2f}%</div>
+        </div>""", unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"""<div class='metric-card' style='text-align:center'>
+          <div class='metric-label'>價格波動倍數</div>
+          <div class='metric-value' style='font-size:1.5rem;color:{p_col}'>{p_ratio:.2f}x</div>
+          <div class='metric-sub' style='color:#9e9890'>門檻 {y_val:.1f}x</div>
+        </div>""", unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"""<div class='metric-card' style='text-align:center'>
+          <div class='metric-label'>最新成交量變幅</div>
+          <div class='metric-value' style='font-size:1.3rem;color:{v_col}'>{lat['vol_abs']:+.2f}%</div>
+          <div class='metric-sub' style='color:#9e9890'>前{int(x_val)}根均 {lat['avg_vol_abs']:.2f}%</div>
+        </div>""", unsafe_allow_html=True)
+    with c4:
+        st.markdown(f"""<div class='metric-card' style='text-align:center'>
+          <div class='metric-label'>成交量波動倍數</div>
+          <div class='metric-value' style='font-size:1.5rem;color:{v_col}'>{v_ratio:.2f}x</div>
+          <div class='metric-sub' style='color:#9e9890'>門檻 {y_val:.1f}x</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("")
+
+    # 警報狀態橫幅
+    if both_triggered:
+        st.markdown(
+            f"<div style='background:#fdecea;border:2px solid #c0392b;border-radius:8px;"
+            f"padding:.75rem 1.2rem;text-align:center;font-weight:700;color:#c0392b;"
+            f"font-size:.95rem'>⚡ 異常波動警報觸發！價格 {p_ratio:.2f}x ＆ 成交量 {v_ratio:.2f}x "
+            f"均超過 {y_val:.1f}x 門檻</div>",
+            unsafe_allow_html=True)
+    else:
+        missing = []
+        if p_ratio < y_val: missing.append(f"價格波動不足（{p_ratio:.2f}x < {y_val:.1f}x）")
+        if v_ratio < y_val: missing.append(f"成交量波動不足（{v_ratio:.2f}x < {y_val:.1f}x）")
+        st.markdown(
+            f"<div style='background:#f9f7f4;border:1px solid #e0dbd2;border-radius:8px;"
+            f"padding:.6rem 1.2rem;text-align:center;color:#9e9890;font-size:.82rem'>"
+            f"○ 未觸發　{'　'.join(missing)}</div>",
+            unsafe_allow_html=True)
+
+    st.markdown("")
+
+    # ── 詳細數據表格 ──────────────────────────────────────────────────────────
+    st.markdown("<div class='section-heading' style='font-size:.85rem'>📋 最新一根 vs 前{X}根均值</div>".replace('{X}', str(int(x_val))),
+                unsafe_allow_html=True)
+
+    tbl_rows = ""
+    rows_data = [
+        ("收盤漲跌幅",
+         f"{lat['price_abs']:+.2f}%",
+         f"{lat['avg_price_abs']:.2f}%",
+         f"{p_ratio:.2f}x",
+         p_ratio >= y_val),
+        ("成交量變化幅",
+         f"{lat['vol_abs']:+.2f}%",
+         f"{lat['avg_vol_abs']:.2f}%",
+         f"{v_ratio:.2f}x",
+         v_ratio >= y_val),
+    ]
+    for label, latest_v, avg_v, ratio, triggered in rows_data:
+        bg     = "#fdecea" if triggered else "#f9f7f4"
+        r_col  = "#c0392b" if triggered else "#6b6560"
+        flag   = "⚡ 超標" if triggered else "○ 正常"
+        tbl_rows += (
+            f"<tr style='background:{bg}'>"
+            f"<td style='padding:8px 12px;font-size:.82rem;color:#6b6560'>{label}</td>"
+            f"<td style='padding:8px 12px;font-family:IBM Plex Mono,monospace;font-size:.82rem;font-weight:600'>{latest_v}</td>"
+            f"<td style='padding:8px 12px;font-family:IBM Plex Mono,monospace;font-size:.82rem;color:#9e9890'>{avg_v}</td>"
+            f"<td style='padding:8px 12px;font-family:IBM Plex Mono,monospace;font-size:.9rem;font-weight:700;color:{r_col}'>{ratio}</td>"
+            f"<td style='padding:8px 12px;font-size:.78rem;color:{r_col}'>{flag}</td>"
+            f"</tr>"
+        )
+
+    st.markdown(
+        f"<div style='border:1px solid #e0dbd2;border-radius:8px;overflow:hidden'>"
+        f"<table style='width:100%;border-collapse:collapse'>"
+        f"<thead><tr style='background:#f9f7f4;border-bottom:1.5px solid #e0dbd2'>"
+        f"<th style='padding:7px 12px;text-align:left;font-size:.72rem;color:#9e9890'>指標</th>"
+        f"<th style='padding:7px 12px;text-align:left;font-size:.72rem;color:#9e9890'>最新一根</th>"
+        f"<th style='padding:7px 12px;text-align:left;font-size:.72rem;color:#9e9890'>前{int(x_val)}根均值</th>"
+        f"<th style='padding:7px 12px;text-align:left;font-size:.72rem;color:#9e9890'>波動倍數</th>"
+        f"<th style='padding:7px 12px;text-align:left;font-size:.72rem;color:#9e9890'>狀態</th>"
+        f"</tr></thead>"
+        f"<tbody>{tbl_rows}</tbody>"
+        f"</table></div>",
+        unsafe_allow_html=True
+    )
+
+    st.markdown("")
+
+    # ── 圖表：歷史波動倍數走勢 ────────────────────────────────────────────────
+    st.markdown("<div class='section-heading' style='font-size:.85rem'>📈 歷史波動倍數走勢</div>",
+                unsafe_allow_html=True)
+
+    bar_dates    = [b['date'] for b in bars]
+    p_ratios_arr = [b['price_ratio']  for b in bars]
+    v_ratios_arr = [b['vol_ratio']    for b in bars]
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.06, row_heights=[0.5, 0.5],
+                        subplot_titles=["價格波動倍數", "成交量波動倍數"])
+
+    # 顏色：超標的bar顯示紅色，正常顯示藍/綠
+    p_colors = ["#c0392b" if p >= y_val else "#4a7c6f" for p in p_ratios_arr]
+    v_colors = ["#c0392b" if v >= y_val else "#5b8fd4" for v in v_ratios_arr]
+
+    fig.add_trace(go.Bar(
+        x=bar_dates, y=p_ratios_arr, name="價格波動倍數",
+        marker_color=p_colors, opacity=0.85,
+    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        x=bar_dates, y=v_ratios_arr, name="成交量波動倍數",
+        marker_color=v_colors, opacity=0.85,
+    ), row=2, col=1)
+
+    # 觸發門檻線
+    fig.add_hline(y=y_val, row=1, col=1,
+                  line=dict(color='#c0392b', width=1.5, dash='dash'),
+                  annotation_text=f"門檻 {y_val:.1f}x",
+                  annotation_font=dict(color='#c0392b', size=9))
+    fig.add_hline(y=y_val, row=2, col=1,
+                  line=dict(color='#c0392b', width=1.5, dash='dash'),
+                  annotation_text=f"門檻 {y_val:.1f}x",
+                  annotation_font=dict(color='#c0392b', size=9))
+
+    # 標記歷史同時觸發的時間點
+    trig_dates = [b['date'] for b in triggered_hist]
+    trig_p     = [b['price_ratio']  for b in triggered_hist]
+    trig_v     = [b['vol_ratio']    for b in triggered_hist]
+    if trig_dates:
+        fig.add_trace(go.Scatter(
+            x=trig_dates, y=trig_p, mode='markers',
+            marker=dict(symbol='star', color='#c0392b', size=12,
+                        line=dict(width=1, color='#8b1a10')),
+            name='同時觸發', showlegend=True,
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=trig_dates, y=trig_v, mode='markers',
+            marker=dict(symbol='star', color='#c0392b', size=12,
+                        line=dict(width=1, color='#8b1a10')),
+            name='同時觸發', showlegend=False,
+        ), row=2, col=1)
+
+    fig.update_layout(
+        plot_bgcolor='#ffffff', paper_bgcolor='#f9f7f4',
+        height=480, margin=dict(l=55, r=60, t=40, b=15),
+        font=dict(family='IBM Plex Mono', color='#6b6560', size=9),
+        legend=dict(bgcolor='rgba(255,255,255,.85)', bordercolor='#ede9e3',
+                    borderwidth=1, font=dict(size=9)),
+        hovermode='x unified',
+        showlegend=True,
+    )
+    axis_style = dict(gridcolor='#ede9e3', linecolor='#e0dbd2',
+                      tickfont=dict(size=8, color='#9e9890'))
+    fig.update_xaxes(**axis_style)
+    fig.update_yaxes(**axis_style)
+
+    intraday = interval in {"1m","5m","15m","30m","1h"}
+    if intraday:
+        fig.update_xaxes(rangebreaks=[dict(bounds=["sat","mon"]),
+                                       dict(bounds=[16,9.5], pattern="hour")])
+    else:
+        fig.update_xaxes(rangebreaks=[dict(bounds=["sat","mon"])])
+
+    st.plotly_chart(fig, use_container_width=True,
+                    config={"scrollZoom": True, "displaylogo": False})
+
+    # 歷史觸發統計
+    if triggered_hist:
+        st.markdown(
+            f"<div style='font-size:.78rem;color:#c0392b;margin-top:.3rem'>"
+            f"⚡ 歷史上共 <b>{len(triggered_hist)}</b> 次同時觸發（{y_val:.1f}x 門檻），"
+            f"最近一次：{str(triggered_hist[-1]['date'])[:10]}</div>",
+            unsafe_allow_html=True)
+
+    # ── Telegram 警報 ─────────────────────────────────────────────────────────
+    if tg_enabled and both_triggered:
+        spike_key = f"{ticker}_{str(lat['date'])[:16]}"
+        if spike_key not in st.session_state.spike_monitor_fired:
+            st.session_state.spike_monitor_fired[spike_key] = True
+            from analysis.volatility_spike import build_spike_tg_msg
+            from analysis.telegram_bot import send_telegram_alert
+            msg = build_spike_tg_msg(ticker, interval, result, y_val, lat)
+            if send_telegram_alert(tg_token, tg_chat_id, msg):
+                st.toast(f"⚡ {ticker} 異常波動警報已發送！價格 {p_ratio:.2f}x ＆ 量 {v_ratio:.2f}x",
+                         icon="⚡")
+
+
 # ── 跳空監控核心 ──────────────────────────────────────────────────────────────
 def _detect_gaps_two_bars(ticker: str, interval: str, bar_count: int) -> list[dict]:
     """
@@ -1687,6 +1950,10 @@ def render_ticker(ctx: dict):
     # ── 跳空歷史分析區塊 ─────────────────────────────────────────────────────
     st.markdown("<div class='section-heading'>🕳️ 跳空歷史分析</div>", unsafe_allow_html=True)
     _render_gap_history(df, ticker, interval)
+
+    # ── 異常波動監控區塊 ─────────────────────────────────────────────────────
+    st.markdown("<div class='section-heading'>⚡ 異常波動監控</div>", unsafe_allow_html=True)
+    _render_volatility_spike(df, ticker, interval, tg_token, tg_chat_id)
 
     # Telegram signal alert (BUY/SELL) - 純文字格式，無 HTML
     if tg_token and tg_chat_id and sig in ('BUY','SELL'):

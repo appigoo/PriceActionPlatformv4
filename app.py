@@ -85,6 +85,7 @@ _ss("gap_alerts",    {})   # {ticker: {cond_key: {enabled, last_fired}}}
 _ss("gap_monitor_on", False)  # 跳空監控總開關
 _ss("gap_monitor_fired",  {})  # {ticker_dir_hash: True} 去重
 _ss("spike_monitor_fired",{})  # {ticker_bar_hash: True} 去重
+_ss("spike_monitor_on",  False)  # 全部異常波動監控總開關
 _ss("spike_x",            20)   # 參考根數 X
 _ss("spike_y",            2.0)  # 觸發倍數 Y
 
@@ -874,6 +875,29 @@ with st.sidebar:
             f"padding:.5rem .75rem;font-size:.72rem;color:#2d6a4f;margin-bottom:.5rem'>"
             f"🚨 跳空監控中 · {interval_lbl} · {len(st.session_state.stock_list)} 支<br>"
             f"<span style='color:#6b9e8a'>已觸發 {fired_cnt} 次提醒</span></div>",
+            unsafe_allow_html=True)
+
+    # ── 全部異常波動監控按鈕 ──────────────────────────────────────────────────
+    spike_mon_on = st.session_state.spike_monitor_on
+    spike_btn_lbl = ("⏹ 停止異常波動監控" if spike_mon_on
+                     else "⚡ 一鍵全部異常波動監控" if has_tg_now
+                     else "⚡ 異常波動監控（需填 Telegram）")
+    if st.button(spike_btn_lbl, use_container_width=True, key="spike_mon_toggle",
+                 disabled=(not has_tg_now and not spike_mon_on)):
+        st.session_state.spike_monitor_on   = not spike_mon_on
+        st.session_state.spike_monitor_fired = {}
+        st.rerun()
+
+    # 異常波動監控狀態指示
+    if spike_mon_on:
+        spike_fired_cnt = len(st.session_state.spike_monitor_fired)
+        x_cur = st.session_state.get('spike_x', 20)
+        y_cur = st.session_state.get('spike_y', 2.0)
+        st.markdown(
+            f"<div style='background:#fff3e0;border:1px solid #ffcc80;border-radius:7px;"
+            f"padding:.5rem .75rem;font-size:.72rem;color:#b07d2e;margin-bottom:.5rem'>"
+            f"⚡ 異常波動監控中 · X={x_cur} · Y={y_cur:.1f}x · {len(st.session_state.stock_list)} 支<br>"
+            f"<span style='color:#c49a3c'>已觸發 {spike_fired_cnt} 次提醒</span></div>",
             unsafe_allow_html=True)
 
     st.markdown("---")
@@ -2083,9 +2107,67 @@ def run_all_monitors():
 run_all_monitors()
 
 
+# ── 全部異常波動背景監控 ────────────────────────────────────────────────────────
+def _run_spike_monitor(stock_list: list, interval: str, bar_count: int):
+    """
+    遍歷所有股票，即時計算最新一根的異常波動，觸發時發 Telegram。
+    使用 session_state 中的 spike_x / spike_y 參數。
+    """
+    if not st.session_state.spike_monitor_on:
+        return
+
+    tg_t = st.session_state.get("_tg_token", "")
+    tg_c = st.session_state.get("_tg_chat",  "")
+    if not tg_t or not tg_c:
+        return
+
+    x_val = int(st.session_state.get("spike_x", 20))
+    y_val = float(st.session_state.get("spike_y", 2.0))
+
+    from analysis.data_fetcher      import fetch_ohlcv
+    from analysis.volatility_spike  import (compute_volatility_spike,
+                                            build_spike_tg_msg)
+    from analysis.telegram_bot      import send_telegram_alert
+
+    for ticker in stock_list:
+        try:
+            df = fetch_ohlcv(ticker, interval, bar_count)
+            if df is None or len(df) < x_val + 2:
+                continue
+
+            result = compute_volatility_spike(df, x=x_val)
+            if result is None:
+                continue
+
+            lat = result['latest']
+            p_r = lat['price_ratio']
+            v_r = lat['vol_ratio']
+
+            if p_r < y_val or v_r < y_val:
+                continue   # 未同時觸發
+
+            # 去重 key：ticker + 時間精確到分鐘
+            spike_key = f"{ticker}_{str(lat['date'])[:16]}"
+            if spike_key in st.session_state.spike_monitor_fired:
+                continue
+
+            st.session_state.spike_monitor_fired[spike_key] = True
+
+            msg = build_spike_tg_msg(ticker, interval, result, y_val, lat)
+            send_telegram_alert(tg_t, tg_c, msg)
+            st.toast(
+                f"⚡ {ticker} 異常波動！價格 {p_r:.2f}x ＆ 量 {v_r:.2f}x",
+                icon="⚡"
+            )
+
+        except Exception:
+            continue
+
+
 # ── 主介面：多股票 Tabs ────────────────────────────────────────────────────────
 stock_list = st.session_state.stock_list
 _run_gap_monitor(stock_list, interval, bar_count)
+_run_spike_monitor(stock_list, interval, bar_count)
 if not stock_list:
     st.info("請在左側股票池新增股票代號")
     st.stop()
